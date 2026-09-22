@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Galton Board Simulator — V2</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1117;--panel:#151b23;--text:#eef4fa;--muted:#97a6b7;--line:#344052;--blue:#86d2ff}
+*{box-sizing:border-box}body{margin:0;background:#0d1117;color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+main{width:min(1180px,calc(100% - 28px));margin:24px auto 40px}h1{margin:0;font-size:clamp(1.45rem,2.5vw,2.2rem)}
+.sub{margin:5px 0 18px;color:var(--muted)}.version-link{margin:0 0 12px;font-size:.84rem}.version-link a{color:var(--blue)}.config,.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.config{margin-bottom:12px}.layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px;align-items:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px}.board-card{padding:12px}
+canvas{display:block;width:100%;height:auto;aspect-ratio:1.25;background:linear-gradient(#111923,#0b1017);border-radius:10px}
+.controls{padding-top:11px}button,select,input{font:inherit}button,select,input[type=number]{border:1px solid #425168;background:#202a38;color:var(--text);border-radius:8px;padding:8px 10px}
+button{cursor:pointer}button:hover{background:#2a3748}.primary{background:#17405b;border-color:#4e8bb1}
+label{color:var(--muted);display:inline-flex;gap:6px;align-items:center}input[type=number]{width:78px}.status{margin-left:auto;color:var(--muted);font-size:.82rem}
+.side{padding:15px}.side h2{font-size:1rem;margin:0 0 10px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.stat{padding:9px;background:#1b2330;border:1px solid #2e3a4b;border-radius:9px}.k{color:var(--muted);font-size:.75rem}.v{font-size:1.15rem;font-variant-numeric:tabular-nums}
+.route{white-space:pre-wrap;margin-top:12px;padding:10px;min-height:52px;background:#101722;border:1px solid #2e3a4b;border-radius:9px;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}
+.bins{margin-top:12px;border-top:1px solid #2e3a4b;max-height:340px;overflow:auto}.bin{display:grid;grid-template-columns:48px 1fr 45px;gap:7px;align-items:center;padding:5px 0;font-size:.8rem}
+.bar{height:7px;background:#283344;border-radius:9px;overflow:hidden}.bar i{display:block;height:100%;background:#78c7f2}.hint{margin-top:12px;color:var(--muted);font-size:.76rem;line-height:1.45}
+@media(max-width:860px){.layout{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+<h1>Galton Board Simulator</h1>
+<p class="sub">V2 · One marble at a time. The random experiment is generated first; the animation only replays its stored history.</p>
+<p class="version-link"><a href="../galton-board-simulator/">Open V1</a></p>
+<div class="config">
+<label>Rows <input id="rows" type="number" min="4" max="16" value="10"></label>
+<label>Marbles <input id="marbles" type="number" min="1" max="5000" value="300"></label>
+<button id="new" class="primary">New Experiment</button>
+<button id="replay">Replay Same Experiment</button>
+</div>
+<div class="layout">
+<section class="card board-card">
+<canvas id="board" width="900" height="720"></canvas>
+<div class="controls">
+<button id="rew">⏪ Fast Rewind</button>
+<button id="play" class="primary">▶ Play</button>
+<button id="ff">Fast Forward ⏩</button>
+<button id="reset">↺ Reset</button>
+<label>Speed <select id="speed">
+<option>.25</option><option>.5</option><option selected>1</option><option>2</option><option>5</option><option>20</option><option>100</option>
+</select>×</label>
+<span id="clock" class="status"></span>
+</div>
+</section>
+<aside class="card side">
+<h2>Experiment state</h2>
+<div class="stats">
+<div class="stat"><div class="k">Current marble</div><div class="v" id="cur">0</div></div>
+<div class="stat"><div class="k">Total marbles</div><div class="v" id="tot">0</div></div>
+<div class="stat"><div class="k">Settled</div><div class="v" id="done">0</div></div>
+<div class="stat"><div class="k">Playback</div><div class="v" id="spd">1×</div></div>
+</div>
+<div id="route" class="route">No marble in motion.</div>
+<div id="bins" class="bins"></div>
+<div class="hint"><b>Keyboard:</b> Space = play/pause · [ = slower · ] = faster.<br>Click Fast Forward/Rewind to jump 50 marbles. Hold either button to scan rapidly; releasing restores play or pause. Replay preserves the stored experiment.</div>
+</aside>
+</div>
+</main>
+<script>
+(function(){
+"use strict";
+var Q=function(id){return document.getElementById(id)}, C=Q("board"), X=C.getContext("2d");
+var exp=null, playhead=0, playing=false, last=null, speed=1,scan=null,suppressScanClick=false;
+var segMs=180, settleMs=80, speeds=[.25,.5,1,2,5,20,100],scanSpeed=100,quickJumpMarbles=50,holdMs=220;
+
+function Experiment(rows,n){
+ this.rows=rows;this.n=n;this.routes=[];this.dest=[];
+ for(var m=0;m<n;m++){
+  var a=new Uint8Array(rows),r=0;
+  for(var i=0;i<rows;i++){a[i]=Math.random()<.5?0:1;r+=a[i]}
+  this.routes.push(a);this.dest.push(r);
+ }
+}
+function dur(){return (exp.rows+1)*segMs+settleMs}
+function total(){return dur()*exp.n}
+function clamp(t){return Math.max(0,Math.min(total(),t))}
+function snap(){
+ var d=dur(),complete=Math.min(exp.n,Math.floor(playhead/d));
+ if(complete>=exp.n||playhead>=total())return{complete:exp.n,current:null,local:0};
+ return{complete:complete,current:complete,local:playhead-complete*d};
+}
+function geom(){
+ var W=C.width,H=C.height,n=exp.rows,top=70,bottom=H*.66,gap=(bottom-top)/Math.max(1,n-1);
+ var step=W*.72/Math.max(2,n),cx=W/2,binTop=bottom+gap*.72,binBottom=H-30;
+ return{W:W,H:H,n:n,top:top,gap:gap,step:step,cx:cx,binTop:binTop,binBottom:binBottom,first:cx-n*step/2};
+}
+function pin(g,row,index){return{x:g.cx+(index-row/2)*g.step,y:g.top+row*g.gap}}
+function binx(g,b){return g.first+b*g.step}
+function counts(k){
+ var a=new Array(exp.rows+1).fill(0);
+ for(var i=0;i<k;i++)a[exp.dest[i]]++;
+ return a;
+}
+function draw(){
+ if(!exp)return;
+ var g=geom(),s=snap();X.clearRect(0,0,g.W,g.H);
+ var ct=counts(s.complete),bc=exp.rows+1;
+ X.save();X.strokeStyle="#536176";X.lineWidth=2;
+ for(var b=0;b<=bc;b++){var xx=g.first+(b-.5)*g.step;X.beginPath();X.moveTo(xx,g.binTop);X.lineTo(xx,g.binBottom);X.stroke()}
+ X.beginPath();X.moveTo(g.first-.5*g.step,g.binBottom);X.lineTo(g.first+(bc-.5)*g.step,g.binBottom);X.stroke();
+ var vr=g.binBottom-g.binTop-8,slotW=Math.max(4,g.step-8),largest=Math.max.apply(null,[1].concat(ct));
+ for(b=0;b<bc;b++){
+  var columns=Math.max(1,Math.ceil(Math.sqrt(ct[b]*slotW/Math.max(1,vr)))),rows=Math.max(1,Math.ceil(ct[b]/columns));
+  var rad=Math.min(4.5,slotW/(columns*2.12),vr/(rows*1.92));
+  if(rad<.8){
+   var fill=ct[b]/largest*vr;X.fillStyle="rgba(120,199,242,.38)";X.fillRect(binx(g,b)-slotW/2,g.binBottom-4-fill,slotW,fill);
+   X.fillStyle="#eef4fa";X.font="bold 12px system-ui";X.textAlign="center";X.fillText(String(ct[b]),binx(g,b),g.binTop+16);continue;
+  }
+  var cw=(columns-1)*rad*2.02;
+  for(var j=0;j<ct[b];j++){var col=j%columns,row=Math.floor(j/columns);X.beginPath();X.arc(binx(g,b)-cw/2+col*rad*2.02,g.binBottom-rad-4-row*rad*1.8,rad,0,Math.PI*2);X.fillStyle="#78c7f2";X.fill()}
+ }
+ X.restore();
+ X.save();
+ for(var rr=0;rr<g.n;rr++)for(var p=0;p<=rr;p++){var q=pin(g,rr,p);X.beginPath();X.arc(q.x,q.y,5,0,Math.PI*2);X.fillStyle="#d8e2ec";X.fill()}
+ X.fillStyle="#8392a5";X.font="12px system-ui";X.textAlign="center";for(b=0;b<=g.n;b++)X.fillText(String(b),binx(g,b),g.binBottom+19);X.restore();
+ if(s.current!==null)drawBall(g,s);
+}
+function drawBall(g,s){
+ var a=exp.routes[s.current],segment=Math.floor(s.local/segMs),t=(s.local%segMs)/segMs;
+ if(segment>exp.rows){segment=exp.rows;t=1}
+ var start,end,rights=0,i;
+ if(segment===0){start={x:g.cx,y:g.top-g.gap*.75};end=pin(g,0,0)}
+ else{
+  for(i=0;i<segment-1;i++)rights+=a[i];
+  start=pin(g,segment-1,rights);
+  rights+=a[segment-1];
+  end=segment<exp.rows?pin(g,segment,rights):{x:binx(g,rights),y:g.binBottom-13};
+ }
+ var e=t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+ var x=start.x+(end.x-start.x)*e,y=start.y+(end.y-start.y)*e-Math.sin(Math.PI*e)*Math.min(8,g.gap*.12);
+ X.save();X.shadowColor="rgba(124,199,255,.5)";X.shadowBlur=12;X.beginPath();X.arc(x,y,8,0,Math.PI*2);X.fillStyle="#8fd5fb";X.fill();X.restore();
+}
+function fmt(ms){var s=Math.max(0,ms)/1000,m=Math.floor(s/60);return m+":"+(s%60).toFixed(1).padStart(4,"0")}
+function update(){
+ var s=snap();draw();
+ Q("cur").textContent=s.current===null?(s.complete?"—":"0"):String(s.current+1);
+ Q("tot").textContent=exp.n;Q("done").textContent=s.complete;Q("spd").textContent=speed+"×";
+ Q("play").textContent=playing?"⏸ Pause":"▶ Play";Q("clock").textContent=fmt(playhead)+" / "+fmt(total());
+ if(s.current===null)Q("route").textContent="No marble in motion.";
+ else{
+  var a=exp.routes[s.current],decision=Math.max(0,Math.min(exp.rows,Math.floor(s.local/segMs)));
+  var z=[];for(var i=0;i<exp.rows;i++)z.push(i<decision?(a[i]?"R":"L"):"·");
+  Q("route").textContent="Marble "+(s.current+1)+"\n"+z.join(" ");
+ }
+ var ct=counts(s.complete),mx=Math.max.apply(null,[1].concat(ct)),h="";
+ for(var b=0;b<ct.length;b++)h+='<div class="bin"><span>Bin '+b+'</span><span class="bar"><i style="width:'+(ct[b]/mx*100)+'%"></i></span><span style="text-align:right">'+ct[b]+'</span></div>';
+ Q("bins").innerHTML=h;
+}
+function make(){
+ var r=Math.max(4,Math.min(16,Number(Q("rows").value)||10)),n=Math.max(1,Math.min(5000,Number(Q("marbles").value)||300));
+ Q("rows").value=r;Q("marbles").value=n;exp=new Experiment(r,n);playhead=0;playing=false;last=null;update();
+}
+function toggle(){if(playhead>=total())playhead=0;playing=!playing;last=null;update()}
+function setSpeed(v){speed=v;Q("speed").value=String(v);update()}
+function stepSpeed(d){var i=speeds.indexOf(speed);if(i<0)i=2;i=Math.max(0,Math.min(speeds.length-1,i+d));setSpeed(speeds[i])}
+function quickScan(direction){playhead=clamp(playhead+direction*dur()*quickJumpMarbles);playing=false;last=null;update()}
+function beginScan(e,direction){
+ if(e.button!==0||scan)return;e.preventDefault();e.currentTarget.setPointerCapture(e.pointerId);
+ scan={direction:direction,started:performance.now(),wasPlaying:playing};playing=false;last=null;
+}
+function endScan(){
+ if(!scan)return;var active=scan;scan=null;suppressScanClick=true;
+ var elapsed=performance.now()-active.started;
+ if(elapsed<holdMs)quickScan(active.direction);
+ else {playhead=clamp(playhead+active.direction*elapsed*scanSpeed);playing=active.wasPlaying;last=null;update()}
+}
+function bindScan(id,direction){
+ var button=Q(id);button.onpointerdown=function(e){beginScan(e,direction)};
+ button.onpointerup=endScan;button.onpointercancel=endScan;
+ button.onclick=function(){if(suppressScanClick){suppressScanClick=false;return}quickScan(direction)};
+}
+function frame(ts){
+ if(scan){last=null}
+ else if(playing&&exp){if(last===null)last=ts;var dt=Math.min(100,ts-last);last=ts;playhead=clamp(playhead+dt*speed);if(playhead>=total()){playing=false;playhead=total()}update()}else last=null;
+ requestAnimationFrame(frame);
+}
+Q("new").onclick=make;Q("replay").onclick=function(){playhead=0;playing=true;last=null;update()};
+Q("play").onclick=toggle;Q("reset").onclick=function(){playhead=0;playing=false;last=null;update()};
+bindScan("rew",-1);bindScan("ff",1);
+Q("speed").onchange=function(){setSpeed(Number(this.value))};
+addEventListener("keydown",function(e){if(/INPUT|SELECT|BUTTON/.test(e.target.tagName))return;if(e.code==="Space"){e.preventDefault();toggle()}else if(e.key==="[")stepSpeed(-1);else if(e.key==="]")stepSpeed(1)});
+make();requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
